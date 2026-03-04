@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+motor
+pydantic
+python-dotenv
+email-validator
+certifi
+httpx
+python-dateutil==2.9.0.post0
