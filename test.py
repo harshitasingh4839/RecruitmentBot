@@ -8,8 +8,8 @@ async def main():
     context = {
         "candidateId": "cand_001",
         "recruiterEmail": "harshita.singh@foyr.com",
-        "jobId": "jd_002",
-        "jobTitle": "AI Engineer",
+        "jobId": "jd_001",
+        "jobTitle": "Data Scientist",
         "provider": "google",
         "timezone": "Asia/Kolkata",
         "mode": "google_meet",

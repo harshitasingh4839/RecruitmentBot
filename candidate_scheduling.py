@@ -122,6 +122,8 @@ async def get_next_available_slots_logic(
     job_title = session.get("jobTitle")
     timezone = session.get("timezone") or "Asia/Kolkata"
     last_shown_start_at_utc = session.get("lastShownStartAtUtc")
+    shown_slot_ids = session.get("shownSlotIds") or []
+    seen_slot_ids = session.get("seenSlotIds") or shown_slot_ids
 
     now = utcnow_fn()
     released_holds = await _release_expired_holds(
