@@ -17,7 +17,10 @@ def _env(name: str) -> str:
 
 def get_google_scopes() -> str:
     # Stored as space-separated in env, returned as space-separated in auth URL
-    scopes = os.getenv("GOOGLE_SCOPES", "https://www.googleapis.com/auth/calendar.readonly").strip()
+    scopes = os.getenv(
+        "GOOGLE_SCOPES",
+        "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly"
+    ).strip()
     return scopes
 
 def build_google_auth_url(state: str) -> str:

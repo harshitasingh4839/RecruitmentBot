@@ -10,7 +10,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query, Request, Header
 from fastapi.responses import HTMLResponse, JSONResponse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Any
+from typing import Any, Optional
 from db import get_db
 from zoneinfo import ZoneInfo
 from schemas import (
@@ -25,7 +25,17 @@ from schemas import (
     ProposeSlotsResponse,
     Slot, 
     SaveSlotsRequest,
-    SaveSlotsResponse
+    SaveSlotsResponse,
+    GetNextAvailableSlotsRequest,
+    GetNextAvailableSlotsResponse,
+    ConfirmCandidateSlotBookingRequest,
+    ConfirmCandidateSlotBookingResponse,
+    CancelCandidateInterviewRequest,
+    CancelCandidateInterviewResponse,
+    RescheduleCandidateInterviewRequest,
+    RescheduleCandidateInterviewResponse,
+    ResolveCandidateSchedulingSessionRequest,
+    ResolveCandidateSchedulingSessionResponse
     )
 from oauth_google import build_google_auth_url, new_state_token, exchange_code_for_tokens, utcnow, expires_at_from, get_google_scopes
 
@@ -37,6 +47,14 @@ from slot_engine import (
     parse_any_iso, merge_intervals, subtract_busy,
     generate_slots_from_intervals
 )
+from candidate_scheduling import (
+    # start_candidate_scheduling_session_logic,
+      get_next_available_slots_logic
+)
+from confirm_booking import confirm_candidate_slot_booking_logic
+from cancel_booking import cancel_candidate_interview_logic
+from reschedule_booking import reschedule_candidate_interview_logic
+from resolve_candidate_scheduling import resolve_candidate_scheduling_session_logic
 import logging
 from logging_config import setup_logging
 
@@ -47,9 +65,30 @@ COLL_CAL_CONN = "recruiterCalendarConnections"
 COLL_OAUTH_STATES = "oauthStates"
 COLL_SLOT_PROPOSALS = "slotProposals"
 COLL_AVAIL_SLOTS = "availabilitySlots"
+COLL_CANDIDATES = "candidateData"
+COLL_RECRUITERS = "recruiterData"
+COLL_CANDIDATE_SESSIONS = "candidateSchedulingSessions"
+COLL_SCHEDULED_INTERVIEWS = "scheduledInterviews"
+COLL_INTERVIEW_REMINDERS = "interviewReminders"
 
 def utcnow():
     return datetime.now(timezone.utc)
+def parse_utc_slot_dt(value: str) -> datetime:
+    """Parse a UTC ISO string like 2026-03-12T05:30:00Z into a timezone-aware datetime."""
+    normalized = value.replace("Z", "+00:00")
+    return datetime.fromisoformat(normalized).astimezone(timezone.utc)
+
+def compute_slot_expiry(end_at_utc: str, grace_minutes: int = 15) -> datetime:
+    # Small grace period keeps the slot visible through the exact boundary and gives
+    # operational cushion for late booking/cleanup races.
+    return parse_utc_slot_dt(end_at_utc) + timedelta(minutes=grace_minutes)
+
+def validate_recruiter_job_metadata(job_id: str, job_title: Optional[str]) -> tuple[str, Optional[str]]:
+    clean_job_id = job_id.strip()
+    if not clean_job_id:
+        raise HTTPException(status_code=400, detail="jobId is required for candidate scheduling.")
+    clean_job_title = job_title.strip() if job_title else None
+    return clean_job_id, (clean_job_title or None)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -92,7 +131,7 @@ async def lifespan(app: FastAPI):
     await db[COLL_SLOT_PROPOSALS].create_index(
         [("recruiterEmail", 1), 
          ("createdAt", -1)], 
-         name="recruiter_createdAt"
+        name="proposal_recruiter_createdAt"
     )
     # Prevent duplicate slot inserts for same recruiter/provider/start/end
     await db[COLL_AVAIL_SLOTS].create_index(
@@ -102,14 +141,86 @@ async def lifespan(app: FastAPI):
     )
     await db[COLL_AVAIL_SLOTS].create_index(
         [("recruiterEmail", 1), ("createdAt", -1)],
-        name="recruiter_createdAt"
+        name="slot_recruiter_createdAt"
     )
-    await db[COLL_SLOT_PROPOSALS].create_index(
-        [("proposalId", 1)],
+    # Candidate-side fetch will primarily filter by recruiter + job + active status and sort by time.
+    await db[COLL_AVAIL_SLOTS].create_index(
+        [("recruiterEmail", 1), ("jobId", 1), ("status", 1), ("startAtUtc", 1)],
+        name="slot_fetch_for_candidate"
+    )
+    # Cleanup/ops helpers for temporary holds and past slots.
+    await db[COLL_AVAIL_SLOTS].create_index(
+        [("holdExpiresAt", 1)],
+        name="slot_hold_expiry_lookup"
+    )
+    await db[COLL_AVAIL_SLOTS].create_index(
+        [("slotExpiresAt", 1)],
+        expireAfterSeconds=0,
+        name="ttl_slot_expiresAt"
+    )
+    await db[COLL_RECRUITERS].create_index(
+        [("recruiterId", 1)],
         unique=True,
-        name="uniq_proposalId"
+        name="uniq_recruiterId"
     )
-    
+    await db[COLL_RECRUITERS].create_index(
+        [("phone", 1)],
+        name="recruiter_phone"
+    )
+    await db[COLL_RECRUITERS].create_index(
+        [("email", 1)],
+        name="recruiter_email"
+    )
+    await db[COLL_CANDIDATES].create_index(
+        [("candidateId", 1)],
+        unique=True,
+        name="uniq_candidateId"
+    )
+    await db[COLL_CANDIDATES].create_index(
+        [("phone", 1)],
+        name="candidate_phone"
+    )
+    await db[COLL_CANDIDATES].create_index(
+        [("email", 1)],
+        name="candidate_email"
+    )
+    await db[COLL_CANDIDATE_SESSIONS].create_index(
+        [("sessionId", 1)],
+        unique=True,
+        name="uniq_candidate_sessionId"
+    )
+    await db[COLL_CANDIDATE_SESSIONS].create_index(
+        [("candidateId", 1), ("recruiterEmail", 1), ("jobId", 1), ("status", 1), ("updatedAt", -1)],
+        name="candidate_session_lookup"
+    )
+    await db[COLL_CANDIDATE_SESSIONS].create_index(
+        [("candidateId", 1), ("recruiterEmail", 1), ("jobId", 1)],
+        unique=True,
+        partialFilterExpression={"status": "active"},
+        name="uniq_active_candidate_session"
+    )
+    await db[COLL_CANDIDATE_SESSIONS].create_index(
+        [("expiresAt", 1)],
+        expireAfterSeconds=0,
+        name="ttl_candidate_session_expiresAt"
+    )
+    await db[COLL_SCHEDULED_INTERVIEWS].create_index(
+    [("scheduledInterviewId", 1)],
+    unique=True,
+    name="uniq_scheduledInterviewId"
+    )
+    await db[COLL_SCHEDULED_INTERVIEWS].create_index(
+    [("candidateId", 1), ("jobId", 1), ("status", 1), ("updatedAt", -1)],
+    name="scheduled_interview_lookup"
+    )
+    await db[COLL_INTERVIEW_REMINDERS].create_index(
+    [("scheduledInterviewId", 1), ("sendAt", 1), ("status", 1)],
+    name="interview_reminder_due_lookup"
+    )
+    await db[COLL_INTERVIEW_REMINDERS].create_index(
+    [("scheduledInterviewId", 1), ("status", 1)],
+    name="reminder_interview_status_lookup"
+    )
     yield
     # Shutdown (if needed)
 
@@ -518,6 +629,7 @@ async def propose_slots(payload: ProposeSlotsRequest, db=Depends(get_db)):
         "provider": payload.provider,
         "timezone": tz_name,
         "jobId": payload.jobId,
+        "jobTitle": payload.jobTitle,
         "mode": payload.mode,
         "slotDurationMinutes": payload.slotDurationMinutes,
         "bufferMinutes": payload.bufferMinutes,
@@ -526,6 +638,7 @@ async def propose_slots(payload: ProposeSlotsRequest, db=Depends(get_db)):
         "slots": [s.model_dump() for s in slots_out],
         "status": "draft",
         "createdAt": utcnow(),
+        "updatedAt": utcnow(),
         "expiresAt": expires_at
     })
 
@@ -550,8 +663,9 @@ async def save_slots(payload: SaveSlotsRequest, db=Depends(get_db)):
     email = payload.recruiterEmail.lower().strip()
     provider = payload.provider
     proposal_id = payload.proposalId.strip()
+    job_id, job_title = validate_recruiter_job_metadata(payload.jobId, payload.jobTitle)
 
-    logger.info(f"SaveSlots called for proposal {proposal_id} by {email}")
+    logger.info(f"SaveSlots called for proposal {proposal_id} by {email} jobId={job_id}")
 
     # 1) Fetch proposal
     proposal = await db[COLL_SLOT_PROPOSALS].find_one(
@@ -582,20 +696,30 @@ async def save_slots(payload: SaveSlotsRequest, db=Depends(get_db)):
     now = utcnow()
     docs = []
     for s in slots:
+        slot_end_utc = s["endAtUtc"]
         # s is expected to have startAtUtc/endAtUtc + local versions from proposeSlots
         docs.append({
             "recruiterEmail": email,
             "provider": provider,
             "timezone": proposal.get("timezone", "Asia/Kolkata"),
-            "jobId": payload.jobId or proposal.get("jobId"),
+            "jobId": job_id,
+            "jobTitle": job_title or proposal.get("jobTitle"),
             "mode": payload.mode or proposal.get("mode"),
             "startAtUtc": s["startAtUtc"],
-            "endAtUtc": s["endAtUtc"],
+            "endAtUtc": slot_end_utc,
             "startAtLocal": s.get("startAtLocal"),
             "endAtLocal": s.get("endAtLocal"),
+            "slotExpiresAt": compute_slot_expiry(slot_end_utc),
             "sourceProposalId": proposal_id,
             "status": "active",
-            "createdAt": now
+            "holdCandidateId": None,
+            "holdSessionId": None,
+            "holdExpiresAt": None,
+            "bookedCandidateId": None,
+            "scheduledInterviewId": None,
+            "bookedAt": None,
+            "createdAt": now,
+            "updatedAt": now
         })
 
     # 3) Insert (handle duplicates gracefully)
@@ -625,6 +749,209 @@ async def save_slots(payload: SaveSlotsRequest, db=Depends(get_db)):
         savedCount=int(saved_count),
         message=f"Saved {saved_count} availability slots."
     )
+
+# Endpoint to resolve an active candidate scheduling session for a candidate + job, which checks if the session is still valid and returns necessary info for the candidate to book slots, if not valid then create a new session and return info (idempotent for active sessions)
+@app.post(
+    "/tools/resolveCandidateSchedulingSession",
+    response_model=ResolveCandidateSchedulingSessionResponse
+)
+async def resolve_candidate_scheduling_session(
+    payload: ResolveCandidateSchedulingSessionRequest,
+    db=Depends(get_db)
+):
+    return await resolve_candidate_scheduling_session_logic(
+        payload=payload,
+        db=db,
+        coll_candidates=COLL_CANDIDATES,
+        coll_recruiters=COLL_RECRUITERS,
+        coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+        coll_avail_slots=COLL_AVAIL_SLOTS,
+        coll_scheduled_interviews=COLL_SCHEDULED_INTERVIEWS,
+        validate_recruiter_job_metadata=validate_recruiter_job_metadata,
+        utcnow_fn=utcnow,
+        logger=logger,
+    )
+
+# # Candidate scheduling endpoints
+# @app.post("/tools/startCandidateSchedulingSession", response_model=StartCandidateSchedulingSessionResponse)
+# async def start_candidate_scheduling_session(
+#     payload: StartCandidateSchedulingSessionRequest,
+#     db=Depends(get_db)
+# ):
+#     return await start_candidate_scheduling_session_logic(
+#         payload=payload,
+#         db=db,
+#         coll_candidates=COLL_CANDIDATES,
+#         coll_recruiters=COLL_RECRUITERS,
+#         coll_avail_slots=COLL_AVAIL_SLOTS,
+#         coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+#         validate_recruiter_job_metadata=validate_recruiter_job_metadata,
+#         utcnow_fn=utcnow,
+#         logger=logger,
+#     )
+
+# Endpoint to get next available slots for a candidate scheduling session (with pagination)
+@app.post(
+    "/tools/getNextAvailableSlots",
+    response_model=GetNextAvailableSlotsResponse
+)
+async def get_next_available_slots(
+    payload: GetNextAvailableSlotsRequest,
+    db=Depends(get_db),
+):
+    return await get_next_available_slots_logic(
+        payload=payload,
+        db=db,
+        coll_avail_slots=COLL_AVAIL_SLOTS,
+        coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+        utcnow_fn=utcnow,
+        logger=logger,
+    )
+
+# Endpoint to confirm a candidate's slot booking, which creates a scheduled interview and sends confirmation email
+@app.post("/tools/confirmCandidateSlotBooking", response_model=ConfirmCandidateSlotBookingResponse)
+async def confirm_candidate_slot_booking(
+    payload: ConfirmCandidateSlotBookingRequest,
+    db=Depends(get_db)
+):
+    return await confirm_candidate_slot_booking_logic(
+        payload=payload,
+        db=db,
+        coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+        coll_avail_slots=COLL_AVAIL_SLOTS,
+        coll_scheduled_interviews=COLL_SCHEDULED_INTERVIEWS,
+        coll_interview_reminders=COLL_INTERVIEW_REMINDERS,
+        coll_recruiters=COLL_RECRUITERS,
+        coll_cal_conn=COLL_CAL_CONN,
+        utcnow_fn=utcnow,
+        send_email_fn=send_email_smtp,
+        logger=logger,
+    )
+
+# Endpoint to cancel a candidate's scheduled interview, which frees up the slot and sends cancellation email
+@app.post(
+    "/tools/cancelCandidateInterview",
+    response_model=CancelCandidateInterviewResponse
+)
+async def cancel_candidate_interview(
+    payload: CancelCandidateInterviewRequest,
+    db=Depends(get_db),
+):
+    return await cancel_candidate_interview_logic(
+        payload=payload,
+        db=db,
+        coll_scheduled_interviews=COLL_SCHEDULED_INTERVIEWS,
+        coll_interview_reminders=COLL_INTERVIEW_REMINDERS,
+        coll_avail_slots=COLL_AVAIL_SLOTS,
+        coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+        coll_recruiters=COLL_RECRUITERS,
+        coll_cal_conn=COLL_CAL_CONN,
+        utcnow_fn=utcnow,
+        send_email_fn=send_email_smtp,
+        logger=logger,
+    )
+
+# Endpoint to reschedule a candidate's interview, which updates the scheduled interview with a new slot and sends rescheduling email
+@app.post(
+    "/tools/rescheduleCandidateInterview",
+    response_model=RescheduleCandidateInterviewResponse
+)
+async def reschedule_candidate_interview(
+    payload: RescheduleCandidateInterviewRequest,
+    db=Depends(get_db),
+):
+    return await reschedule_candidate_interview_logic(
+        payload=payload,
+        db=db,
+        coll_scheduled_interviews=COLL_SCHEDULED_INTERVIEWS,
+        coll_interview_reminders=COLL_INTERVIEW_REMINDERS,
+        coll_avail_slots=COLL_AVAIL_SLOTS,
+        coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+        coll_recruiters=COLL_RECRUITERS,
+        coll_cal_conn=COLL_CAL_CONN,
+        utcnow_fn=utcnow,
+        logger=logger,
+    )
+
+# Endpoint to check if calendar is connected, and if not, create OAuth state and send connection email(checkCalendarConnection + startGoogleOAuth combined)
+@app.post("/tools/checkOrStartCalendarConnection", response_model=CheckCalendarConnectionResponse)
+async def check_or_start_calendar_connection(
+    payload: CheckCalendarConnectionRequest,
+    db=Depends(get_db)
+):
+    email = payload.recruiterEmail.lower().strip()
+    provider = payload.provider
+
+    if provider != "google":
+        raise HTTPException(status_code=400, detail="Only google is supported right now.")
+
+    # 1) Check existing calendar connection
+    doc = await db[COLL_CAL_CONN].find_one(
+        {"recruiterEmail": email, "provider": provider},
+        projection={"_id": 0, "status": 1}
+    )
+
+    if doc and doc.get("status") == "connected":
+        return CheckCalendarConnectionResponse(
+            message="Calendar already connected."
+        )
+
+    # 2) If not connected, create OAuth state
+    state = new_state_token()
+    expires_at = utcnow() + timedelta(minutes=10)
+
+    await db[COLL_OAUTH_STATES].insert_one({
+        "state": state,
+        "provider": "google",
+        "recruiterEmail": email,
+        "createdAt": utcnow(),
+        "expiresAt": expires_at
+    })
+
+    # 3) Build Google OAuth URL
+    auth_url = build_google_auth_url(state)
+
+    # 4) Send OAuth link via email
+    subject = "Connect your Google Calendar to Scheduler Bot"
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; line-height: 1.4;">
+      <p>Hi,</p>
+      <p>Please connect your Google Calendar to allow us to check your availability and avoid conflicts while generating interview slots.</p>
+      <p><a href="{auth_url}" target="_blank" rel="noreferrer">Click here to connect Google Calendar</a></p>
+      <p>If the button does not work, copy and paste this link into your browser:</p>
+      <p style="word-break: break-all;">{auth_url}</p>
+      <p>This link is valid for a short time. After connecting, return to the app to continue.</p>
+      <p>Thanks,<br/>Scheduler Bot</p>
+    </div>
+    """
+
+    text_body = f"""Please connect your Google Calendar:
+
+{auth_url}
+
+After connecting, return to the app to continue.
+"""
+
+    try:
+        await anyio.to_thread.run_sync(
+            send_email_smtp,
+            email,
+            subject,
+            html_body,
+            text_body
+        )
+    except Exception as e:
+        logger.exception("Failed to send OAuth email")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to send calendar connection email: {str(e)}"
+        )
+
+    return CheckCalendarConnectionResponse(
+        message="Calendar is not connected. A connection link has been sent to your email. Please click the link in the email to connect your calendar."
+    )
+
+
 
 # if __name__ == "__main__":
 #     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 9009)))
