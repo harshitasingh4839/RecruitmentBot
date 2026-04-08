@@ -262,6 +262,126 @@ class RescheduleCandidateInterviewResponse(BaseModel):
     availableActions: List[str] = []
     message: str
 
+class StartCandidateRescheduleRequest(BaseModel):
+    scheduledInterviewId: str = Field(min_length=1)
+    requestedBy: str = Field(default="candidate")
+
+    @field_validator("scheduledInterviewId", "requestedBy")
+    @classmethod
+    def validate_required_fields(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("value must not be empty")
+        return v
+
+class StartCandidateRescheduleRequestResponse(BaseModel):
+    oldScheduledInterviewId: str
+    sessionId: Optional[str] = None
+    candidateId: str
+    recruiterEmail: EmailStr
+    jobId: str
+    jobTitle: Optional[str] = None
+    slots: List[CandidateSlotOption]
+    messageText: str
+    hasMore: bool
+    nextAction: Literal["show_slots", "no_slots_available"] = "show_slots"
+    availableActions: List[str] = []
+    message: str
+
+class CreateCandidateRescheduleRequestRequest(BaseModel):
+    sessionId: str = Field(min_length=1)
+    slotId: Optional[str] = None
+    selectedIndex: Optional[int] = Field(default=None, ge=1, le=3)
+
+    @field_validator("sessionId")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("sessionId must not be empty")
+        return v
+
+    @field_validator("slotId")
+    @classmethod
+    def validate_slot_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @model_validator(mode="after")
+    def validate_selection(self):
+        if not self.slotId and self.selectedIndex is None:
+            raise ValueError("Provide either slotId or selectedIndex.")
+        return self
+
+class CreateCandidateRescheduleRequestResponse(BaseModel):
+    requestId: str
+    sessionId: str
+    oldScheduledInterviewId: str
+    candidateId: str
+    recruiterEmail: EmailStr
+    jobId: str
+    jobTitle: Optional[str] = None
+    requestedSlotId: str
+    requestedSlotDisplayText: str
+    requestStatus: str
+    messageText: str
+    availableActions: List[str] = []
+    message: str
+
+class ApproveRescheduleRequestRequest(BaseModel):
+    requestId: str = Field(min_length=1)
+    reviewedBy: str = Field(min_length=1)
+
+class ApproveRescheduleRequestResponse(BaseModel):
+    requestId: str
+    oldScheduledInterviewId: str
+    newScheduledInterviewId: str
+    candidateId: str
+    recruiterEmail: EmailStr
+    jobId: str
+    jobTitle: Optional[str] = None
+    approved: bool
+    messageText: str
+    message: str
+
+class RejectRescheduleRequestRequest(BaseModel):
+    requestId: str = Field(min_length=1)
+    reviewedBy: str = Field(min_length=1)
+    reason: Optional[str] = None
+
+class RejectRescheduleRequestResponse(BaseModel):
+    requestId: str
+    oldScheduledInterviewId: str
+    candidateId: str
+    recruiterEmail: EmailStr
+    jobId: str
+    jobTitle: Optional[str] = None
+    rejected: bool
+    messageText: str
+    message: str
+
+class RescheduleRequestDashboardItem(BaseModel):
+    requestId: str
+    scheduledInterviewId: str
+    candidateId: str
+    candidateName: Optional[str] = None
+    recruiterEmail: EmailStr
+    jobId: str
+    jobTitle: Optional[str] = None
+    requestStatus: str
+    requestedSlotId: str
+    requestedSlotDisplayText: Optional[str] = None
+    requestedAt: Optional[str] = None
+    reviewedAt: Optional[str] = None
+    reviewedBy: Optional[str] = None
+    reviewComment: Optional[str] = None
+
+class ListRescheduleRequestsResponse(BaseModel):
+    items: List[RescheduleRequestDashboardItem]
+    message: str
+
 class ResolveCandidateSchedulingSessionRequest(BaseModel):
     recruiterEmail: EmailStr
     candidateId: str = Field(min_length=1)

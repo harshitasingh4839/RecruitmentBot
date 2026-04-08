@@ -73,6 +73,8 @@ Current runtime context:
 - timezone: {timezone_name}
 - provider: {context.get("provider", "google")}
 - mode: {context.get("mode", "google_meet")}
+- flowType: {context.get("flowType")}
+- rescheduleRequestState: {context.get("rescheduleRequestState")}
 - current timestamp: {today}
 
 Behavior rules:
@@ -82,7 +84,9 @@ Behavior rules:
 - If the candidate sends "hi", "hello", "start", "schedule interview", "check slots", or similar, first resolve the session and guide them from there.
 - If slots are shown and the candidate replies with "1", "2", or "3", book that corresponding slot using selectedIndex.
 - If the candidate asks for "more slots", "show more", "another slot", "next slots", fetch more slots using the active session.
-- If the candidate already has an interview scheduled and asks to reschedule, use the reschedule tool.
+- If the candidate already has an interview scheduled and asks to reschedule, first explain that rescheduling needs recruiter approval and ask them to confirm they want to initiate the request.
+- Only after the candidate clearly confirms, start the reschedule request flow and show alternate slots.
+- If alternate slots have been shown as part of a reschedule request flow, a reply with 1, 2, or 3 means submit a reschedule request for that selected slot, not an immediate booking.
 - If the candidate asks to cancel, use the cancel tool.
 - When a tool returns a ready-made WhatsApp-friendly messageText, prefer using that wording or lightly polish it while preserving meaning.
 - If there are no slots, say that politely and invite them to check again later.
@@ -93,12 +97,13 @@ Important decision policy:
 - Do not invent slots, dates, links, session IDs, or interview IDs.
 - Only confirm a booking after the booking tool succeeds.
 - Only confirm cancellation after the cancel tool succeeds.
-- Only confirm reschedule after the reschedule tool succeeds.
+- Never say the interview has been rescheduled until recruiter approval is complete.
+- After the candidate submits a reschedule request, clearly say the current interview remains unchanged until the recruiter reviews it.
 
 Interpretation rules:
 - Numeric reply "1", "2", or "3" after slots are shown means select that slot.
 - "More slots" means fetch the next batch for the active session.
-- "Reschedule" means candidate wants to move the existing interview.
+- "Reschedule" means candidate wants to move the existing interview, but that should begin as an approval-based request flow.
 - "Cancel", "delete interview", "remove interview" mean cancel the existing interview.
 
 Style examples:
@@ -147,9 +152,21 @@ class CancelInterviewInput(BaseModel):
     cancelledBy: str = "candidate"
 
 
-class RescheduleInterviewInput(BaseModel):
+class StartRescheduleRequestInput(BaseModel):
     scheduledInterviewId: str = Field(..., min_length=1)
     requestedBy: str = "candidate"
+
+
+class CreateRescheduleRequestInput(BaseModel):
+    sessionId: str = Field(..., min_length=1)
+    slotId: Optional[str] = None
+    selectedIndex: Optional[int] = Field(default=None, ge=1, le=3)
+
+    @model_validator(mode="after")
+    def validate_selection(self):
+        if not self.slotId and self.selectedIndex is None:
+            raise ValueError("Provide either slotId or selectedIndex.")
+        return self
 
 
 # -----------------------------------------------------------------------------
@@ -246,6 +263,8 @@ async def confirm_candidate_slot_booking_tool(
         data = result["data"]
         context["activeSessionId"] = data.get("sessionId") or context.get("activeSessionId")
         context["scheduledInterviewId"] = data.get("scheduledInterviewId")
+        context["flowType"] = None
+        context["rescheduleRequestState"] = None
         return data
     return result
 
@@ -255,34 +274,63 @@ async def cancel_candidate_interview_tool(
     context: dict[str, Any],
 ) -> dict[str, Any]:
     parsed = CancelInterviewInput(
-        scheduledInterviewId=args.get("scheduledInterviewId") or context.get("scheduledInterviewId") or "",
+        scheduledInterviewId=context.get("scheduledInterviewId") or args.get("scheduledInterviewId") or "",
         cancelledBy=args.get("cancelledBy", "candidate"),
     )
     result = await _post_json("/tools/cancelCandidateInterview", parsed.model_dump())
 
     if result["ok"]:
         data = result["data"]
+        context["persistSessionId"] = data.get("sessionId")
         context["scheduledInterviewId"] = None
         context["activeSessionId"] = None
+        context["flowType"] = None
+        context["rescheduleRequestState"] = None
+        context["pendingRescheduleRequestId"] = None
         return data
     return result
 
 
-async def reschedule_candidate_interview_tool(
+async def start_candidate_reschedule_request_tool(
     args: dict[str, Any],
     context: dict[str, Any],
 ) -> dict[str, Any]:
-    parsed = RescheduleInterviewInput(
-        scheduledInterviewId=args.get("scheduledInterviewId") or context.get("scheduledInterviewId") or "",
+    parsed = StartRescheduleRequestInput(
+        scheduledInterviewId=context.get("scheduledInterviewId") or args.get("scheduledInterviewId") or "",
         requestedBy=args.get("requestedBy", "candidate"),
     )
-    result = await _post_json("/tools/rescheduleCandidateInterview", parsed.model_dump())
+    result = await _post_json("/tools/startCandidateRescheduleRequest", parsed.model_dump())
 
     if result["ok"]:
         data = result["data"]
-        context["scheduledInterviewId"] = None
-        if data.get("newSessionId"):
-            context["activeSessionId"] = data["newSessionId"]
+        context["flowType"] = "reschedule_request"
+        context["rescheduleRequestState"] = "awaiting_slot_selection"
+        context["scheduledInterviewId"] = data.get("oldScheduledInterviewId") or context.get("scheduledInterviewId")
+        if data.get("sessionId"):
+            context["activeSessionId"] = data["sessionId"]
+            context["persistSessionId"] = data["sessionId"]
+        return data
+    return result
+
+
+async def create_candidate_reschedule_request_tool(
+    args: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    parsed = CreateRescheduleRequestInput(
+        sessionId=args.get("sessionId") or context.get("activeSessionId") or "",
+        slotId=args.get("slotId"),
+        selectedIndex=args.get("selectedIndex"),
+    )
+    result = await _post_json("/tools/createCandidateRescheduleRequest", parsed.model_dump(exclude_none=True))
+
+    if result["ok"]:
+        data = result["data"]
+        context["flowType"] = "reschedule_request"
+        context["rescheduleRequestState"] = "request_submitted"
+        context["pendingRescheduleRequestId"] = data.get("requestId")
+        context["persistSessionId"] = data.get("sessionId") or context.get("persistSessionId")
+        context["activeSessionId"] = None
         return data
     return result
 
@@ -334,7 +382,8 @@ TOOLS = [
         "type": "function",
         "name": "confirm_candidate_slot_booking",
         "description": (
-            "Use this when the candidate selects one of the shown slots. "
+            "Use this when the candidate selects one of the shown slots during normal booking flow. "
+            "Do not use this for reschedule-request slots that still need recruiter approval. "
             "Prefer selectedIndex when the candidate replies with 1, 2, or 3."
         ),
         "parameters": {
@@ -350,10 +399,10 @@ TOOLS = [
     },
     {
         "type": "function",
-        "name": "reschedule_candidate_interview",
+        "name": "start_candidate_reschedule_request",
         "description": (
-            "Use this when the candidate already has an interview scheduled and wants to change it. "
-            "This cancels the old interview and returns replacement slots if available."
+            "Use this only after the candidate clearly confirms they want to initiate a reschedule request that needs recruiter approval. "
+            "This shows alternate slots but does not change the current interview yet."
         ),
         "parameters": {
             "type": "object",
@@ -362,6 +411,24 @@ TOOLS = [
                 "requestedBy": {"type": "string"},
             },
             "required": ["scheduledInterviewId"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "create_candidate_reschedule_request",
+        "description": (
+            "Use this when alternate slots have already been shown as part of the reschedule approval flow and the candidate selects 1, 2, or 3. "
+            "This submits the request for recruiter review and does not immediately reschedule the interview."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sessionId": {"type": "string"},
+                "slotId": {"type": ["string", "null"]},
+                "selectedIndex": {"type": ["integer", "null"], "minimum": 1, "maximum": 3},
+            },
+            "required": ["sessionId"],
             "additionalProperties": False,
         },
     },
@@ -387,7 +454,8 @@ TOOL_IMPLS = {
     "resolve_candidate_scheduling_session": resolve_candidate_scheduling_session_tool,
     "get_next_available_slots": get_next_available_slots_tool,
     "confirm_candidate_slot_booking": confirm_candidate_slot_booking_tool,
-    "reschedule_candidate_interview": reschedule_candidate_interview_tool,
+    "start_candidate_reschedule_request": start_candidate_reschedule_request_tool,
+    "create_candidate_reschedule_request": create_candidate_reschedule_request_tool,
     "cancel_candidate_interview": cancel_candidate_interview_tool,
 }
 
@@ -459,4 +527,3 @@ async def run_candidate_scheduler_agent(
             tools=TOOLS,
             temperature=0.7,
         )
-

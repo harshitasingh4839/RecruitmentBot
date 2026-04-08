@@ -5,6 +5,7 @@ import anyio
 from email_utils import send_email_smtp
 import secrets
 from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 import json
 from fastapi import FastAPI, Depends, HTTPException, Query, Request, Header
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -34,6 +35,15 @@ from schemas import (
     CancelCandidateInterviewResponse,
     RescheduleCandidateInterviewRequest,
     RescheduleCandidateInterviewResponse,
+    StartCandidateRescheduleRequest,
+    StartCandidateRescheduleRequestResponse,
+    CreateCandidateRescheduleRequestRequest,
+    CreateCandidateRescheduleRequestResponse,
+    ApproveRescheduleRequestRequest,
+    ApproveRescheduleRequestResponse,
+    RejectRescheduleRequestRequest,
+    RejectRescheduleRequestResponse,
+    ListRescheduleRequestsResponse,
     ResolveCandidateSchedulingSessionRequest,
     ResolveCandidateSchedulingSessionResponse
     )
@@ -53,7 +63,14 @@ from candidate_scheduling import (
 )
 from confirm_booking import confirm_candidate_slot_booking_logic
 from cancel_booking import cancel_candidate_interview_logic
-from reschedule_booking import reschedule_candidate_interview_logic
+from reschedule_booking import (
+    reschedule_candidate_interview_logic,
+    start_candidate_reschedule_request_logic,
+    create_candidate_reschedule_request_logic,
+    approve_reschedule_request_logic,
+    reject_reschedule_request_logic,
+    list_reschedule_requests_logic,
+)
 from resolve_candidate_scheduling import resolve_candidate_scheduling_session_logic
 import logging
 from logging_config import setup_logging
@@ -70,6 +87,7 @@ COLL_RECRUITERS = "recruiterData"
 COLL_CANDIDATE_SESSIONS = "candidateSchedulingSessions"
 COLL_SCHEDULED_INTERVIEWS = "scheduledInterviews"
 COLL_INTERVIEW_REMINDERS = "interviewReminders"
+COLL_RESCHEDULE_REQUESTS = "rescheduleRequests"
 
 def utcnow():
     return datetime.now(timezone.utc)
@@ -225,6 +243,14 @@ async def lifespan(app: FastAPI):
     # Shutdown (if needed)
 
 app = FastAPI(title="RecruiterBot Calendar Tools", version="1.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # use specific domain in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -869,8 +895,105 @@ async def reschedule_candidate_interview(
         coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
         coll_recruiters=COLL_RECRUITERS,
         coll_cal_conn=COLL_CAL_CONN,
+        coll_reschedule_requests=COLL_RESCHEDULE_REQUESTS,
         utcnow_fn=utcnow,
         logger=logger,
+    )
+
+
+@app.post(
+    "/tools/startCandidateRescheduleRequest",
+    response_model=StartCandidateRescheduleRequestResponse
+)
+async def start_candidate_reschedule_request(
+    payload: StartCandidateRescheduleRequest,
+    db=Depends(get_db),
+):
+    return await start_candidate_reschedule_request_logic(
+        payload=payload,
+        db=db,
+        coll_scheduled_interviews=COLL_SCHEDULED_INTERVIEWS,
+        coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+        coll_recruiters=COLL_RECRUITERS,
+        coll_avail_slots=COLL_AVAIL_SLOTS,
+        coll_reschedule_requests=COLL_RESCHEDULE_REQUESTS,
+        utcnow_fn=utcnow,
+        logger=logger,
+    )
+
+@app.post(
+    "/tools/createCandidateRescheduleRequest",
+    response_model=CreateCandidateRescheduleRequestResponse
+)
+async def create_candidate_reschedule_request(
+    payload: CreateCandidateRescheduleRequestRequest,
+    db=Depends(get_db),
+):
+    return await create_candidate_reschedule_request_logic(
+        payload=payload,
+        db=db,
+        coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+        coll_scheduled_interviews=COLL_SCHEDULED_INTERVIEWS,
+        coll_avail_slots=COLL_AVAIL_SLOTS,
+        coll_reschedule_requests=COLL_RESCHEDULE_REQUESTS,
+        utcnow_fn=utcnow,
+        logger=logger,
+    )
+
+@app.post(
+    "/tools/approveRescheduleRequest",
+    response_model=ApproveRescheduleRequestResponse
+)
+async def approve_reschedule_request(
+    payload: ApproveRescheduleRequestRequest,
+    db=Depends(get_db),
+):
+    return await approve_reschedule_request_logic(
+        payload=payload,
+        db=db,
+        coll_reschedule_requests=COLL_RESCHEDULE_REQUESTS,
+        coll_scheduled_interviews=COLL_SCHEDULED_INTERVIEWS,
+        coll_interview_reminders=COLL_INTERVIEW_REMINDERS,
+        coll_avail_slots=COLL_AVAIL_SLOTS,
+        coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+        coll_recruiters=COLL_RECRUITERS,
+        coll_cal_conn=COLL_CAL_CONN,
+        coll_interview_reminders_out=COLL_INTERVIEW_REMINDERS,
+        utcnow_fn=utcnow,
+        send_email_fn=send_email_smtp,
+        logger=logger,
+    )
+
+@app.post(
+    "/tools/rejectRescheduleRequest",
+    response_model=RejectRescheduleRequestResponse
+)
+async def reject_reschedule_request(
+    payload: RejectRescheduleRequestRequest,
+    db=Depends(get_db),
+):
+    return await reject_reschedule_request_logic(
+        payload=payload,
+        db=db,
+        coll_reschedule_requests=COLL_RESCHEDULE_REQUESTS,
+        coll_scheduled_interviews=COLL_SCHEDULED_INTERVIEWS,
+        coll_candidate_sessions=COLL_CANDIDATE_SESSIONS,
+        utcnow_fn=utcnow,
+        logger=logger,
+    )
+
+@app.get(
+    "/tools/listRescheduleRequests",
+    response_model=ListRescheduleRequestsResponse
+)
+async def list_reschedule_requests(
+    recruiterEmail: Optional[str] = Query(default=None),
+    db=Depends(get_db),
+):
+    return await list_reschedule_requests_logic(
+        db=db,
+        coll_reschedule_requests=COLL_RESCHEDULE_REQUESTS,
+        recruiter_email=recruiterEmail,
     )
 
 # Endpoint to check if calendar is connected, and if not, create OAuth state and send connection email(checkCalendarConnection + startGoogleOAuth combined)

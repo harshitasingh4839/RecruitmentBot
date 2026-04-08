@@ -14,7 +14,6 @@ except Exception:  # pragma: no cover
     ObjectId = None
 
 from oauth_google_refresh import parse_dt, is_expired, refresh_access_token, compute_expires_at
-from cancel_booking import _delete_google_calendar_event
 from schemas import (
     ConfirmCandidateSlotBookingRequest,
     ConfirmCandidateSlotBookingResponse,
@@ -244,25 +243,6 @@ def _build_email_bodies(
         (subject, recruiter_html, recruiter_text),
     )
 
-
-async def _release_expired_holds(*, db, coll_avail_slots: str, now) -> int:
-    result = await db[coll_avail_slots].update_many(
-        {
-            "status": "held",
-            "holdExpiresAt": {"$lte": now},
-        },
-        {
-            "$set": {
-                "status": "active",
-                "updatedAt": now,
-                "holdCandidateId": None,
-                "holdSessionId": None,
-                "holdExpiresAt": None,
-            }
-        },
-    )
-    return result.modified_count
-
 async def _create_reminder_docs(
     *,
     db,
@@ -282,10 +262,10 @@ async def _create_reminder_docs(
     now = utcnow_fn()
     start_dt = datetime.fromisoformat(start_at_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
     reminder_offsets = [
-        ("24h", timedelta(hours=24)),
-        ("2h", timedelta(hours=2)),
+        # ("24h", timedelta(hours=24)),
+        # ("2h", timedelta(hours=2)),
         ("30m", timedelta(minutes=30)),
-        ("15m", timedelta(minutes=15)),
+        # ("15m", timedelta(minutes=15)),
     ]
 
     docs: list[dict[str, Any]] = []
@@ -322,43 +302,43 @@ async def _create_reminder_docs(
             "updatedAt": now,
         })
 
-        docs.append({
-            "reminderId": "rem_" + secrets.token_urlsafe(12),
-            "scheduledInterviewId": scheduled_interview_id,
-            "channel": "email",
-            "recipient": candidate_email,
-            "recipientType": "candidate",
-            "sendAt": send_at,
-            "status": "pending",
-            "templateType": f"interview_reminder_{label}",
-            "payload": {
-                "candidateName": candidate_name,
-                "jobTitle": job_title,
-                "meetingLink": meeting_link,
-                "timezone": timezone_name,
-            },
-            "createdAt": now,
-            "updatedAt": now,
-        })
+        # docs.append({
+        #     "reminderId": "rem_" + secrets.token_urlsafe(12),
+        #     "scheduledInterviewId": scheduled_interview_id,
+        #     "channel": "email",
+        #     "recipient": candidate_email,
+        #     "recipientType": "candidate",
+        #     "sendAt": send_at,
+        #     "status": "pending",
+        #     "templateType": f"interview_reminder_{label}",
+        #     "payload": {
+        #         "candidateName": candidate_name,
+        #         "jobTitle": job_title,
+        #         "meetingLink": meeting_link,
+        #         "timezone": timezone_name,
+        #     },
+        #     "createdAt": now,
+        #     "updatedAt": now,
+        # })
 
-        docs.append({
-            "reminderId": "rem_" + secrets.token_urlsafe(12),
-            "scheduledInterviewId": scheduled_interview_id,
-            "channel": "email",
-            "recipient": recruiter_email,
-            "recipientType": "recruiter",
-            "sendAt": send_at,
-            "status": "pending",
-            "templateType": f"interview_reminder_{label}",
-            "payload": {
-                "candidateName": candidate_name,
-                "jobTitle": job_title,
-                "meetingLink": meeting_link,
-                "timezone": timezone_name,
-            },
-            "createdAt": now,
-            "updatedAt": now,
-        })
+        # docs.append({
+        #     "reminderId": "rem_" + secrets.token_urlsafe(12),
+        #     "scheduledInterviewId": scheduled_interview_id,
+        #     "channel": "email",
+        #     "recipient": recruiter_email,
+        #     "recipientType": "recruiter",
+        #     "sendAt": send_at,
+        #     "status": "pending",
+        #     "templateType": f"interview_reminder_{label}",
+        #     "payload": {
+        #         "candidateName": candidate_name,
+        #         "jobTitle": job_title,
+        #         "meetingLink": meeting_link,
+        #         "timezone": timezone_name,
+        #     },
+        #     "createdAt": now,
+        #     "updatedAt": now,
+        # })
 
         if recruiter_phone:
             docs.append({
@@ -405,6 +385,8 @@ async def confirm_candidate_slot_booking_logic(
         raise HTTPException(status_code=404, detail="Scheduling session not found.")
     if session.get("status") != "active":
         raise HTTPException(status_code=400, detail="This scheduling session is no longer active.")
+    if session.get("flowType") == "reschedule_request":
+        raise HTTPException(status_code=400, detail="This session is part of the recruiter approval reschedule flow. Submit a reschedule request instead of booking directly.")
     if session.get("scheduledInterviewId"):
         raise HTTPException(status_code=400, detail="This scheduling session has already been booked.")
 
@@ -430,14 +412,6 @@ async def confirm_candidate_slot_booking_logic(
     timezone_name = session.get("timezone") or "Asia/Kolkata"
     mode = session.get("mode") or "google_meet"
     now = utcnow_fn()
-
-    released_holds = await _release_expired_holds(
-        db=db,
-        coll_avail_slots=coll_avail_slots,
-        now=now,
-    )
-    if released_holds:
-        logger.info("[confirmCandidateSlotBooking] released_expired_holds=%s sessionId=%s", released_holds, session_id)
 
     recruiter = await _get_recruiter_doc(db, coll_recruiters, recruiter_email)
 
@@ -472,14 +446,6 @@ async def confirm_candidate_slot_booking_logic(
     end_at_utc = held_slot["endAtUtc"]
     start_at_local = held_slot.get("startAtLocal")
     end_at_local = held_slot.get("endAtLocal")
-    access_token: Optional[str] = None
-    calendar_id: Optional[str] = None
-    created_event_id: Optional[str] = None
-    meeting_link: Optional[str] = None
-    scheduled_interview_id: Optional[str] = None
-    reminder_count = 0
-    inserted_interview = False
-    created_reminders = False
 
     try:
         access_token, calendar_id = await _get_valid_google_access_token(db, coll_cal_conn, recruiter_email)
@@ -496,8 +462,8 @@ async def confirm_candidate_slot_booking_logic(
             timezone_name=timezone_name,
             mode=mode,
         )
-        created_event_id = event_json.get("id")
 
+        meeting_link = None
         entry_points = ((event_json.get("conferenceData") or {}).get("entryPoints") or [])
         for entry in entry_points:
             if entry.get("entryPointType") == "video" and entry.get("uri"):
@@ -528,16 +494,15 @@ async def confirm_candidate_slot_booking_logic(
             "timezone": timezone_name,
             "mode": mode,
             "meetingLink": meeting_link,
-            "calendarEventId": created_event_id,
+            "calendarEventId": event_json.get("id"),
             "calendarHtmlLink": event_json.get("htmlLink"),
             "status": "scheduled",
             "createdAt": now,
             "updatedAt": now,
         }
         await db[coll_scheduled_interviews].insert_one(interview_doc)
-        inserted_interview = True
 
-        slot_update_result = await db[coll_avail_slots].update_one(
+        await db[coll_avail_slots].update_one(
             {"_id": slot_object_id, "holdSessionId": session_id, "status": "held"},
             {"$set": {
                 "status": "booked",
@@ -550,10 +515,8 @@ async def confirm_candidate_slot_booking_logic(
                 "holdExpiresAt": None,
             }}
         )
-        if slot_update_result.modified_count != 1:
-            raise HTTPException(status_code=409, detail="Failed to mark the slot as booked after creating the calendar event.")
 
-        session_update_result = await db[coll_candidate_sessions].update_one(
+        await db[coll_candidate_sessions].update_one(
             {"sessionId": session_id},
             {"$set": {
                 "status": "scheduled",
@@ -562,8 +525,6 @@ async def confirm_candidate_slot_booking_logic(
                 "updatedAt": now,
             }}
         )
-        if session_update_result.matched_count != 1:
-            raise HTTPException(status_code=404, detail="Scheduling session not found while finalizing booking.")
 
         reminder_count = await _create_reminder_docs(
             db=db,
@@ -580,8 +541,7 @@ async def confirm_candidate_slot_booking_logic(
             start_at_utc=start_at_utc,
             utcnow_fn=utcnow_fn,
         )
-        created_reminders = reminder_count > 0
-
+        
         (candidate_subject, candidate_html, candidate_text), (recruiter_subject, recruiter_html, recruiter_text) = _build_email_bodies(
             candidate_name=candidate_name,
             candidate_email=candidate_email,
@@ -597,59 +557,16 @@ async def confirm_candidate_slot_booking_logic(
 
     except Exception:
         logger.exception("[confirmCandidateSlotBooking] booking failed sessionId=%s slotId=%s", session_id, slot_id_raw)
-
-        if created_reminders and scheduled_interview_id:
-            try:
-                await db[coll_interview_reminders].delete_many({"scheduledInterviewId": scheduled_interview_id})
-            except Exception:
-                logger.exception("[confirmCandidateSlotBooking] failed to rollback reminders scheduledInterviewId=%s", scheduled_interview_id)
-
-        if inserted_interview and scheduled_interview_id:
-            try:
-                await db[coll_scheduled_interviews].delete_one({"scheduledInterviewId": scheduled_interview_id})
-            except Exception:
-                logger.exception("[confirmCandidateSlotBooking] failed to rollback interview doc scheduledInterviewId=%s", scheduled_interview_id)
-
-        if created_event_id and access_token and calendar_id:
-            try:
-                await _delete_google_calendar_event(
-                    access_token=access_token,
-                    calendar_id=calendar_id,
-                    event_id=created_event_id,
-                )
-            except Exception:
-                logger.exception("[confirmCandidateSlotBooking] failed to rollback created Google event eventId=%s", created_event_id)
-
-        try:
-            await db[coll_candidate_sessions].update_one(
-                {"sessionId": session_id, "scheduledInterviewId": scheduled_interview_id},
-                {"$set": {
-                    "status": "active",
-                    "scheduledInterviewId": None,
-                    "selectedSlotId": None,
-                    "updatedAt": utcnow_fn(),
-                }}
-            )
-        except Exception:
-            logger.exception("[confirmCandidateSlotBooking] failed to rollback session state sessionId=%s", session_id)
-
-        try:
-            await db[coll_avail_slots].update_one(
-                {"_id": slot_object_id, "$or": [{"holdSessionId": session_id, "status": "held"}, {"scheduledInterviewId": scheduled_interview_id, "status": "booked"}]},
-                {"$set": {
-                    "status": "active",
-                    "updatedAt": utcnow_fn(),
-                    "bookedCandidateId": None,
-                    "scheduledInterviewId": None,
-                    "bookedAt": None,
-                    "holdCandidateId": None,
-                    "holdSessionId": None,
-                    "holdExpiresAt": None,
-                }}
-            )
-        except Exception:
-            logger.exception("[confirmCandidateSlotBooking] failed to rollback slot state slotId=%s", slot_id_raw)
-
+        await db[coll_avail_slots].update_one(
+            {"_id": slot_object_id, "holdSessionId": session_id, "status": "held"},
+            {"$set": {
+                "status": "active",
+                "updatedAt": utcnow_fn(),
+                "holdCandidateId": None,
+                "holdSessionId": None,
+                "holdExpiresAt": None,
+            }}
+        )
         raise
 
     message_text = format_booking_confirmation_message(

@@ -186,8 +186,14 @@ async def cancel_candidate_interview_logic(
     if not interview:
         raise HTTPException(status_code=404, detail="Scheduled interview not found.")
 
-    if interview.get("status") == "cancelled":
+    interview_status = (interview.get("status") or "").strip().lower()
+    if interview_status == "cancelled":
         raise HTTPException(status_code=400, detail="Interview is already cancelled.")
+    if interview_status == "rescheduled":
+        raise HTTPException(
+            status_code=400,
+            detail="This interview has already been replaced by a newer scheduled interview and cannot be cancelled."
+        )
 
     candidate_id = (interview.get("candidateId") or "").strip()
     candidate_name = (interview.get("candidateName") or "").strip()

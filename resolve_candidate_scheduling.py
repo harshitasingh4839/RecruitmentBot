@@ -101,25 +101,6 @@ def _build_slot_options(
     return slot_options, shown_slot_ids
 
 
-
-async def _release_expired_holds(*, db, coll_avail_slots: str, now) -> int:
-    result = await db[coll_avail_slots].update_many(
-        {
-            "status": "held",
-            "holdExpiresAt": {"$lte": now},
-        },
-        {
-            "$set": {
-                "status": "active",
-                "updatedAt": now,
-                "holdCandidateId": None,
-                "holdSessionId": None,
-                "holdExpiresAt": None,
-            }
-        },
-    )
-    return result.modified_count
-
 async def _fetch_first_available_slots(
     *,
     db,
@@ -128,20 +109,15 @@ async def _fetch_first_available_slots(
     job_id: str,
     now_iso: str,
     timezone: str,
-    exclude_slot_ids: Optional[list[str]] = None,
 ) -> tuple[list[CandidateSlotOption], list[str]]:
-    query = {
-        "recruiterEmail": recruiter_email,
-        "jobId": job_id,
-        "status": "active",
-        "startAtUtc": {"$gt": now_iso},
-    }
-
-    exclude_object_ids = _safe_object_ids(exclude_slot_ids or [])
-    if exclude_object_ids:
-        query["_id"] = {"$nin": exclude_object_ids}
-
-    raw_slots = await db[coll_avail_slots].find(query).sort("startAtUtc", 1).limit(3).to_list(length=3)
+    raw_slots = await db[coll_avail_slots].find(
+        {
+            "recruiterEmail": recruiter_email,
+            "jobId": job_id,
+            "status": "active",
+            "startAtUtc": {"$gt": now_iso},
+        }
+    ).sort("startAtUtc", 1).limit(3).to_list(length=3)
 
     return _build_slot_options(raw_slots, timezone)
 
@@ -163,21 +139,6 @@ async def resolve_candidate_scheduling_session_logic(
     candidate_id = payload.candidateId.strip()
     job_id, clean_job_title = validate_recruiter_job_metadata(payload.jobId, payload.jobTitle)
     now = utcnow_fn()
-
-    released_holds = await _release_expired_holds(
-        db=db,
-        coll_avail_slots=coll_avail_slots,
-        now=now,
-    )
-    if released_holds:
-        logger.info(
-            "[resolveCandidateSchedulingSession] released_expired_holds=%s candidateId=%s recruiter=%s jobId=%s",
-            released_holds,
-            candidate_id,
-            recruiter_email,
-            job_id,
-        )
-
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     logger.info(
@@ -213,7 +174,7 @@ async def resolve_candidate_scheduling_session_logic(
                 {"scheduledInterviewId": scheduled_interview_id},
                 projection={"_id": 0, "status": 1},
             )
-            if scheduled_doc and scheduled_doc.get("status") in {"scheduled", "rescheduled"}:
+            if scheduled_doc and scheduled_doc.get("status") in {"scheduled", "rescheduled", "reschedule_requested"}:
                 await db[coll_candidate_sessions].update_one(
                     {"sessionId": session_id},
                     {"$set": {"updatedAt": now, "expiresAt": _session_expiry(now)}},
@@ -231,14 +192,13 @@ async def resolve_candidate_scheduling_session_logic(
                     availableActions=["reschedule", "cancel"],
                     messageText=(
                         f"Hi {candidate_name}, your interview is already scheduled. "
-                        f"Would you like to reschedule or cancel it?"
+                        f"If you’d like to reschedule, I can initiate a request for recruiter approval, or I can help you cancel it."
                     ),
                     message="Active scheduled interview already exists for this session.",
                 )
 
         # 1b) Try to reuse already shown valid slots
         shown_slot_ids = session.get("shownSlotIds") or []
-        seen_slot_ids = session.get("seenSlotIds") or shown_slot_ids
         slot_object_ids = _safe_object_ids(shown_slot_ids)
 
         if slot_object_ids:
@@ -261,8 +221,7 @@ async def resolve_candidate_scheduling_session_logic(
                             "lastShownStartAtUtc": slot_options[-1].startAtUtc,
                             "updatedAt": now,
                             "expiresAt": _session_expiry(now),
-                        },
-                        "$addToSet": {"seenSlotIds": {"$each": refreshed_slot_ids}},
+                        }
                     },
                 )
 
@@ -290,7 +249,6 @@ async def resolve_candidate_scheduling_session_logic(
             job_id=job_id,
             now_iso=now_iso,
             timezone=session_timezone,
-            exclude_slot_ids=seen_slot_ids,
         )
 
         await db[coll_candidate_sessions].update_one(
@@ -301,8 +259,7 @@ async def resolve_candidate_scheduling_session_logic(
                     "lastShownStartAtUtc": fresh_slot_options[-1].startAtUtc if fresh_slot_options else None,
                     "updatedAt": now,
                     "expiresAt": _session_expiry(now),
-                },
-                "$addToSet": {"seenSlotIds": {"$each": fresh_slot_ids}},
+                }
             },
         )
 
@@ -346,7 +303,7 @@ async def resolve_candidate_scheduling_session_logic(
             "candidateId": candidate_id,
             "recruiterEmail": recruiter_email,
             "jobId": job_id,
-            "status": {"$in": ["scheduled", "rescheduled"]},
+            "status": {"$in": ["scheduled", "rescheduled", "reschedule_requested"]},
         },
         sort=[("updatedAt", -1)],
     )
@@ -366,7 +323,7 @@ async def resolve_candidate_scheduling_session_logic(
             availableActions=["reschedule", "cancel"],
             messageText=(
                 f"Hi {candidate_name}, your interview is already scheduled. "
-                f"Would you like to reschedule or cancel it?"
+                f"If you’d like to reschedule, I can initiate a request for recruiter approval, or I can help you cancel it."
             ),
             message="Latest scheduled interview already exists for this candidate and recruiter.",
         )
@@ -394,7 +351,6 @@ async def resolve_candidate_scheduling_session_logic(
         job_id=job_id,
         now_iso=now_iso,
         timezone=payload.timezone,
-        exclude_slot_ids=[],
     )
 
     if not slot_options:
@@ -434,7 +390,6 @@ async def resolve_candidate_scheduling_session_logic(
         "mode": payload.mode,
         "status": "active",
         "shownSlotIds": shown_slot_ids,
-        "seenSlotIds": shown_slot_ids.copy(),
         "lastShownStartAtUtc": slot_options[-1].startAtUtc,
         "scheduledInterviewId": None,
         "createdAt": now,
