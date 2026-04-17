@@ -422,7 +422,6 @@ async def confirm_candidate_slot_booking_logic(
         {
             "_id": slot_object_id,
             "recruiterEmail": recruiter_email,
-            "jobId": job_id,
             "status": "active",
             "startAtUtc": {"$gt": now.strftime("%Y-%m-%dT%H:%M:%SZ")},
         },

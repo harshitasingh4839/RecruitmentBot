@@ -49,6 +49,62 @@ def _parse_mongo_id(raw_id: str) -> ObjectId:
         raise HTTPException(status_code=400, detail="Invalid slotId.")
 
 
+def _format_interview_time(doc: dict[str, Any]) -> str:
+    start_local = doc.get("startAtLocal")
+    end_local = doc.get("endAtLocal")
+    timezone_name = doc.get("timezone") or "Asia/Kolkata"
+    if start_local and end_local:
+        return f"{start_local} to {end_local} ({timezone_name})"
+    if doc.get("startAtUtc") and doc.get("endAtUtc"):
+        return f"{doc['startAtUtc']} to {doc['endAtUtc']}"
+    if doc.get("startAtUtc"):
+        return str(doc["startAtUtc"])
+    return "the currently scheduled time"
+
+
+def _build_reschedule_rejection_email(
+    *,
+    candidate_name: str,
+    job_title: Optional[str],
+    original_slot_text: str,
+    requested_slot_text: Optional[str],
+    reason: Optional[str],
+) -> tuple[str, str, str]:
+    role_text = f" for the {job_title} role" if job_title else ""
+    subject = f"Reschedule request update{role_text}"
+    first_name = candidate_name.split()[0] if candidate_name else "there"
+    requested_html = (
+        f"<p><strong>Requested time:</strong> {requested_slot_text}</p>"
+        if requested_slot_text
+        else ""
+    )
+    requested_text = f"Requested time: {requested_slot_text}\n" if requested_slot_text else ""
+    reason_html = f"<p><strong>Reason:</strong> {reason}</p>" if reason else ""
+    reason_text = f"Reason: {reason}\n" if reason else ""
+
+    html_body = f"""
+    <p>Hi {first_name},</p>
+    <p>Your reschedule request{role_text} was not approved.</p>
+    <p>Your current interview remains scheduled at the original time.</p>
+    <p><strong>Current interview time:</strong> {original_slot_text}</p>
+    {requested_html}
+    {reason_html}
+    <p>If you still need a different time, please reply on WhatsApp and we can help you request another slot.</p>
+    """.strip()
+
+    text_body = (
+        f"Hi {first_name},\n\n"
+        f"Your reschedule request{role_text} was not approved.\n"
+        f"Your current interview remains scheduled at the original time.\n"
+        f"Current interview time: {original_slot_text}\n"
+        f"{requested_text}"
+        f"{reason_text}"
+        "If you still need a different time, please reply on WhatsApp and we can help you request another slot."
+    )
+
+    return subject, html_body, text_body
+
+
 async def _get_recruiter_doc(db, coll_recruiters: str, recruiter_email: str) -> dict[str, Any]:
     recruiter = await db[coll_recruiters].find_one({"email": recruiter_email})
     if not recruiter:
@@ -100,7 +156,6 @@ async def _create_reschedule_session(
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     query: dict[str, Any] = {
         "recruiterEmail": recruiter_email,
-        "jobId": job_id,
         "status": "active",
         "startAtUtc": {"$gt": now_iso},
     }
@@ -314,7 +369,6 @@ async def create_candidate_reschedule_request_logic(
         {
             "_id": _parse_mongo_id(slot_id_raw),
             "recruiterEmail": (session.get("recruiterEmail") or "").strip().lower(),
-            "jobId": (session.get("jobId") or "").strip(),
             "status": "active",
         }
     )
@@ -442,7 +496,6 @@ async def approve_reschedule_request_logic(
         {
             "_id": slot_oid,
             "recruiterEmail": (request_doc.get("recruiterEmail") or "").strip().lower(),
-            "jobId": (request_doc.get("jobId") or "").strip(),
             "status": "active",
             "startAtUtc": {"$gt": now.strftime("%Y-%m-%dT%H:%M:%SZ")},
         },
@@ -672,6 +725,7 @@ async def reject_reschedule_request_logic(
     coll_scheduled_interviews: str,
     coll_candidate_sessions: str,
     utcnow_fn: Callable[[], Any],
+    send_email_fn: Callable[[str, str, str, Optional[str]], None],
     logger,
 ) -> RejectRescheduleRequestResponse:
     request_id = payload.requestId.strip()
@@ -686,6 +740,10 @@ async def reject_reschedule_request_logic(
         raise HTTPException(status_code=400, detail="Only pending requests can be rejected.")
 
     scheduled_interview_id = request_doc["scheduledInterviewId"]
+    interview = await db[coll_scheduled_interviews].find_one(
+        {"scheduledInterviewId": scheduled_interview_id},
+        projection={"_id": 0},
+    )
     await db[coll_reschedule_requests].update_one(
         {"requestId": request_id},
         {"$set": {
@@ -706,6 +764,21 @@ async def reject_reschedule_request_logic(
             {"sessionId": request_doc.get("sessionId")},
             {"$set": {"status": "closed", "rescheduleRequestState": "rejected", "updatedAt": now, "expiresAt": now}}
         )
+
+    candidate_email = (request_doc.get("candidateEmail") or (interview or {}).get("candidateEmail") or "").strip()
+    if candidate_email:
+        original_slot_text = _format_interview_time(interview or {})
+        subject, html_body, text_body = _build_reschedule_rejection_email(
+            candidate_name=request_doc.get("candidateName") or (interview or {}).get("candidateName") or "there",
+            job_title=request_doc.get("jobTitle") or (interview or {}).get("jobTitle"),
+            original_slot_text=original_slot_text,
+            requested_slot_text=request_doc.get("requestedSlotDisplayText"),
+            reason=reason,
+        )
+        try:
+            send_email_fn(candidate_email, subject, html_body, text_body)
+        except Exception:
+            logger.exception("[rejectRescheduleRequest] candidate email send failed requestId=%s", request_id)
 
     message_text = (
         "Reschedule request rejected. The candidate’s current interview remains unchanged."

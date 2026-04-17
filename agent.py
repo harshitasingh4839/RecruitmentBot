@@ -18,7 +18,7 @@ load_dotenv()
 # -----------------------------------------------------------------------------
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SCHEDULER_API_BASE_URL = os.getenv("SCHEDULER_API_BASE_URL", "http://127.0.0.1:9000")
+SCHEDULER_API_BASE_URL = os.getenv("SCHEDULER_API_BASE_URL", "http://127.0.0.1:9009")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 
 if not OPENAI_API_KEY:
@@ -32,6 +32,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Expected context example:
 # {
 #   "candidateId": "cand_001",
+#   "candidateEmail": "candidate@example.com",
 #   "recruiterEmail": "harshita.singh@foyr.com",
 #   "jobId": "jd_001",
 #   "jobTitle": "Data Science",
@@ -50,6 +51,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 def build_system_prompt(context: dict[str, Any]) -> str:
     recruiter_email = context.get("recruiterEmail", "")
     candidate_id = context.get("candidateId", "")
+    candidate_email = context.get("candidateEmail", "")
     job_id = context.get("jobId", "")
     job_title = context.get("jobTitle") or "the role"
     timezone_name = context.get("timezone") or "Asia/Kolkata"
@@ -67,6 +69,7 @@ Your job is to help the candidate:
 
 Current runtime context:
 - candidateId: {candidate_id}
+- candidateEmail: {candidate_email}
 - recruiterEmail: {recruiter_email}
 - jobId: {job_id}
 - jobTitle: {job_title}
@@ -176,7 +179,14 @@ class CreateRescheduleRequestInput(BaseModel):
 async def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"{SCHEDULER_API_BASE_URL.rstrip('/')}{path}"
     async with httpx.AsyncClient(timeout=40) as http_client:
-        resp = await http_client.post(url, json=payload)
+        try:
+            resp = await http_client.post(url, json=payload)
+        except httpx.RequestError as exc:
+            return {
+                "ok": False,
+                "status_code": None,
+                "error": f"Scheduler API is unreachable at {url}: {str(exc)}",
+            }
         if resp.status_code >= 400:
             detail = None
             try:

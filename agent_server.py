@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 COLL_CANDIDATE_SESSIONS = "candidateSchedulingSessions"
 COLL_SCHEDULED_INTERVIEWS = "scheduledInterviews"
+COLL_CANDIDATES = "candidateData"
 
 
 def utcnow():
@@ -66,6 +67,24 @@ def validate_recruiter_job_metadata(job_id: str, job_title: Optional[str]) -> tu
         raise HTTPException(status_code=400, detail="jobId is required.")
     clean_job_title = job_title.strip() if job_title else None
     return clean_job_id, (clean_job_title or None)
+
+
+async def _get_candidate_by_email(db, candidate_email: str) -> dict[str, Any]:
+    candidate = await db[COLL_CANDIDATES].find_one(
+        {"email": candidate_email},
+        projection={"_id": 0, "candidateId": 1, "email": 1},
+    )
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found in candidateData.")
+
+    candidate_id = (candidate.get("candidateId") or "").strip()
+    if not candidate_id:
+        raise HTTPException(status_code=400, detail="Candidate ID missing in candidateData.")
+
+    return {
+        "candidateId": candidate_id,
+        "email": (candidate.get("email") or candidate_email).strip().lower(),
+    }
 
 
 async def _load_candidate_session_context(
@@ -342,7 +361,9 @@ async def run_candidate_whatsapp_agent(
     db=Depends(get_db)
 ):
     recruiter_email = payload.recruiterEmail.lower().strip()
-    candidate_id = payload.candidateId.strip()
+    candidate_email = payload.candidateEmail.lower().strip()
+    candidate = await _get_candidate_by_email(db, candidate_email)
+    candidate_id = candidate["candidateId"]
     job_id, clean_job_title = validate_recruiter_job_metadata(payload.jobId, payload.jobTitle)
     now = utcnow()
     session_doc, scheduled_interview_doc = await _load_candidate_session_context(
@@ -350,7 +371,7 @@ async def run_candidate_whatsapp_agent(
         recruiter_email=recruiter_email,
         candidate_id=candidate_id,
         job_id=job_id,
-        requested_session_id=payload.sessionId,
+        requested_session_id=None,
     )
     resolved_session_id = (session_doc or {}).get("sessionId")
 
@@ -363,6 +384,7 @@ async def run_candidate_whatsapp_agent(
 
     context = {
         "candidateId": candidate_id,
+        "candidateEmail": candidate["email"],
         "recruiterEmail": recruiter_email,
         "jobId": job_id,
         "jobTitle": clean_job_title or saved_context.get("jobTitle"),
@@ -447,6 +469,7 @@ async def run_candidate_whatsapp_agent(
         return RunCandidateWhatsappAgentResponse(
             replyText=full_opening,
             candidateId=candidate_id,
+            candidateEmail=candidate["email"],
             recruiterEmail=recruiter_email,
             jobId=job_id,
             jobTitle=context.get("jobTitle"),
@@ -480,6 +503,7 @@ async def run_candidate_whatsapp_agent(
         return RunCandidateWhatsappAgentResponse(
             replyText=reply_text,
             candidateId=candidate_id,
+            candidateEmail=candidate["email"],
             recruiterEmail=recruiter_email,
             jobId=job_id,
             jobTitle=updated_context.get("jobTitle"),
@@ -513,6 +537,7 @@ async def run_candidate_whatsapp_agent(
     return RunCandidateWhatsappAgentResponse(
         replyText=reply_text,
         candidateId=candidate_id,
+        candidateEmail=candidate["email"],
         recruiterEmail=recruiter_email,
         jobId=job_id,
         jobTitle=updated_context.get("jobTitle"),
@@ -522,3 +547,6 @@ async def run_candidate_whatsapp_agent(
         nextAction=None,
         message="Candidate WhatsApp agent response generated successfully.",
     )
+
+# if __name__ == "__main__":
+#     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 9023)))

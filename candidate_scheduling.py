@@ -139,7 +139,6 @@ async def get_next_available_slots_logic(
 
     query = {
         "recruiterEmail": recruiter_email,
-        "jobId": job_id,
         "status": "active",
         "startAtUtc": start_at_filter,
     }

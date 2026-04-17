@@ -106,14 +106,12 @@ async def _fetch_first_available_slots(
     db,
     coll_avail_slots: str,
     recruiter_email: str,
-    job_id: str,
     now_iso: str,
     timezone: str,
 ) -> tuple[list[CandidateSlotOption], list[str]]:
     raw_slots = await db[coll_avail_slots].find(
         {
             "recruiterEmail": recruiter_email,
-            "jobId": job_id,
             "status": "active",
             "startAtUtc": {"$gt": now_iso},
         }
@@ -246,7 +244,6 @@ async def resolve_candidate_scheduling_session_logic(
             db=db,
             coll_avail_slots=coll_avail_slots,
             recruiter_email=recruiter_email,
-            job_id=job_id,
             now_iso=now_iso,
             timezone=session_timezone,
         )
@@ -348,7 +345,6 @@ async def resolve_candidate_scheduling_session_logic(
         db=db,
         coll_avail_slots=coll_avail_slots,
         recruiter_email=recruiter_email,
-        job_id=job_id,
         now_iso=now_iso,
         timezone=payload.timezone,
     )

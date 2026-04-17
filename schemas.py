@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
-from typing import Literal, Optional, List
+from typing import Any, Dict, Literal, Optional, List
 
 Provider = Literal["google", "microsoft"]
 
@@ -10,6 +10,7 @@ class CheckCalendarConnectionRequest(BaseModel):
 
 class CheckCalendarConnectionResponse(BaseModel):
     message: str
+    status: bool
 
 # Request and response models for starting Google OAuth flow
 class StartGoogleOAuthRequest(BaseModel):
@@ -262,6 +263,7 @@ class RescheduleCandidateInterviewResponse(BaseModel):
     availableActions: List[str] = []
     message: str
 
+# Request and response models for starting the reschedule flow
 class StartCandidateRescheduleRequest(BaseModel):
     scheduledInterviewId: str = Field(min_length=1)
     requestedBy: str = Field(default="candidate")
@@ -288,6 +290,7 @@ class StartCandidateRescheduleRequestResponse(BaseModel):
     availableActions: List[str] = []
     message: str
 
+# Request and response models for creating a reschedule request (which the recruiter can then approve or reject)
 class CreateCandidateRescheduleRequestRequest(BaseModel):
     sessionId: str = Field(min_length=1)
     slotId: Optional[str] = None
@@ -330,6 +333,7 @@ class CreateCandidateRescheduleRequestResponse(BaseModel):
     availableActions: List[str] = []
     message: str
 
+# Request and response models for recruiter approving or rejecting a reschedule request
 class ApproveRescheduleRequestRequest(BaseModel):
     requestId: str = Field(min_length=1)
     reviewedBy: str = Field(min_length=1)
@@ -346,6 +350,7 @@ class ApproveRescheduleRequestResponse(BaseModel):
     messageText: str
     message: str
 
+# Request and response models for rejecting a reschedule request (with optional reason)
 class RejectRescheduleRequestRequest(BaseModel):
     requestId: str = Field(min_length=1)
     reviewedBy: str = Field(min_length=1)
@@ -362,6 +367,7 @@ class RejectRescheduleRequestResponse(BaseModel):
     messageText: str
     message: str
 
+# Response model for listing reschedule requests in the recruiter dashboard (can be used for both pending and past requests)
 class RescheduleRequestDashboardItem(BaseModel):
     requestId: str
     scheduledInterviewId: str
@@ -382,6 +388,7 @@ class ListRescheduleRequestsResponse(BaseModel):
     items: List[RescheduleRequestDashboardItem]
     message: str
 
+# Request and response models for resolving candidate scheduling session (used when candidate clicks on "reschedule" link in calendar invite or email, to show them the available slots and actions)
 class ResolveCandidateSchedulingSessionRequest(BaseModel):
     recruiterEmail: EmailStr
     candidateId: str = Field(min_length=1)
@@ -442,7 +449,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 
 class RunCandidateWhatsappAgentRequest(BaseModel):
     recruiterEmail: EmailStr
-    candidateId: str = Field(min_length=1)
+    candidateEmail: EmailStr
     jobId: str = Field(min_length=1)
     jobTitle: Optional[str] = None
     userPrompt: Optional[str] = None
@@ -450,9 +457,8 @@ class RunCandidateWhatsappAgentRequest(BaseModel):
     provider: str = "google"
     timezone: str = "Asia/Kolkata"
     mode: Optional[str] = "google_meet"
-    sessionId: Optional[str] = None
 
-    @field_validator("candidateId", "jobId")
+    @field_validator("jobId")
     @classmethod
     def validate_required(cls, v: str) -> str:
         v = v.strip()
@@ -476,10 +482,10 @@ class RunCandidateWhatsappAgentRequest(BaseModel):
         v = v.strip()
         return v or None
 
-
 class RunCandidateWhatsappAgentResponse(BaseModel):
     replyText: str
     candidateId: str
+    candidateEmail: EmailStr
     recruiterEmail: EmailStr
     jobId: str
     jobTitle: Optional[str] = None
@@ -488,3 +494,72 @@ class RunCandidateWhatsappAgentResponse(BaseModel):
     availableActions: List[str] = []
     nextAction: Optional[str] = None
     message: str
+
+# Request and response models for saving direct slots (bypassing proposal flow)
+class DirectSlotItem(BaseModel):
+    startAtLocal: str
+    endAtLocal: str
+
+class SaveDirectSlotsRequest(BaseModel):
+    recruiterEmail: EmailStr
+    slots: List[DirectSlotItem] = Field(..., min_length=1)
+    provider: str = "google"
+    timezone: str = "Asia/Kolkata"
+    mode: Optional[str] = "google_meet"
+
+class SaveDirectSlotsResponse(BaseModel):
+    recruiterEmail: str
+    provider: str
+    savedCount: int
+    message: str
+
+# Request model for candidate and recruiter login
+class CandidateLoginRequest(BaseModel):
+    name: str
+    email: EmailStr
+    phone: str
+
+class CandidateSelectedJob(BaseModel):
+    jobId: str = Field(min_length=1)
+    jobTitle: Optional[str] = None
+    recruiterEmail: Optional[EmailStr] = None
+    # metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("jobId")
+    @classmethod
+    def validate_job_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("jobId must not be empty")
+        return v
+
+    @field_validator("jobTitle")
+    @classmethod
+    def normalize_optional_text(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+class CandidateJobSelectionRequest(BaseModel):
+    email: str
+    selectedJob: CandidateSelectedJob
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        v = v.lower().strip()
+        if not v:
+            raise ValueError("email is required for candidate lookup")
+        return v
+
+    @model_validator(mode="after")
+    def require_candidate_lookup(self):
+        if not self.email:
+            raise ValueError("email is required for candidate lookup")
+        return self
+
+class RecruiterLoginRequest(BaseModel):
+    name: str
+    email: EmailStr
+    phone: str
